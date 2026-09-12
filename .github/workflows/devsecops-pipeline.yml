@@ -1,0 +1,232 @@
+# .github/workflows/devsecops-pipeline.yml
+#
+# DevSecOps pipeline for oluonabiyi/Docker-Class-ShopEasy.
+#
+# This repo is a monorepo: backend/ (Node/Express + Postgres + Redis) and
+# frontend/ (React, built and served by nginx), wired together with the root
+# docker-compose.yml. The assignment scopes SonarQube + both Trivy scans to
+# the BACKEND specifically (that's what "ShopEasy backend" means here) — the
+# frontend is still built, pushed and deployed alongside it because the site
+# won't load without it, it just isn't part of the security gate.
+#
+#   1. SonarQube scan (backend/) + Quality Gate check
+#   2. Trivy filesystem scan of backend/ (fails on HIGH/CRITICAL)
+#   3. Build backend + frontend images, push both to Docker Hub
+#   4. Trivy image scan of the backend image (fails on HIGH/CRITICAL)
+#   5. Deploy the full compose stack to EC2, injecting DB_PASSWORD pulled
+#      live from AWS Secrets Manager (least-privilege IAM user, GetSecretValue
+#      on one secret ARN only)
+#
+# Every stage is chained with `needs:`, so a failure anywhere upstream stops
+# the pipeline before build/push/deploy ever run.
+
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ "**" ]
+
+permissions:
+  contents: read
+
+env:
+  BACKEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/shopeasy-backend
+  FRONTEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/shopeasy-frontend
+
+jobs:
+  sonarqube:
+    name: SonarQube Scan (backend)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # SonarQube wants full history for blame/new-code analysis
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'   # matches backend/Dockerfile's FROM node:20
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm install
+
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@v4
+        with:
+          projectBaseDir: backend
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: SonarQube Quality Gate check
+        uses: sonarsource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        # This is what actually fails the job if the Quality Gate is red.
+        # The scan step above only *uploads* results — it doesn't gate anything
+        # on its own, which is exactly the failure mode deliverable #5 asks about.
+
+  trivy-fs-scan:
+    name: Trivy Filesystem Scan (backend)
+    runs-on: ubuntu-latest
+    needs: sonarqube
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          scan-ref: 'backend'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'          # non-zero exit = job fails = pipeline stops here
+          ignore-unfixed: true
+          format: 'table'
+
+  build-and-push:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    needs: trivy-fs-scan
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: meta
+        run: echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push backend
+        run: |
+          docker build \
+            -t ${{ env.BACKEND_IMAGE }}:${{ steps.meta.outputs.tag }} \
+            -t ${{ env.BACKEND_IMAGE }}:latest \
+            ./backend
+          docker push ${{ env.BACKEND_IMAGE }}:${{ steps.meta.outputs.tag }}
+          docker push ${{ env.BACKEND_IMAGE }}:latest
+
+      - name: Build & push frontend
+        run: |
+          docker build \
+            -t ${{ env.FRONTEND_IMAGE }}:${{ steps.meta.outputs.tag }} \
+            -t ${{ env.FRONTEND_IMAGE }}:latest \
+            ./frontend
+          docker push ${{ env.FRONTEND_IMAGE }}:${{ steps.meta.outputs.tag }}
+          docker push ${{ env.FRONTEND_IMAGE }}:latest
+        # Frontend isn't Sonar/Trivy-gated per the assignment scope, but it has
+        # to exist and be pushed or the site has nothing to serve the UI with.
+
+  trivy-image-scan:
+    name: Trivy Image Scan (backend)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Run Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: '${{ env.BACKEND_IMAGE }}:${{ needs.build-and-push.outputs.image_tag }}'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'
+          ignore-unfixed: true
+          format: 'table'
+        # NOTE: this pulls the pushed image to scan it, so a vulnerable image
+        # has technically already reached Docker Hub by this point. To block it
+        # from ever being pushed, scan the local `docker build` output (via
+        # `docker save` -> `trivy image --input`) before the push step instead.
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: trivy-image-scan
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Retrieve DB secret from Secrets Manager
+        id: get_secret
+        run: |
+          SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id shopeasy/db-password \
+            --query SecretString --output text)
+          DB_PASSWORD=$(echo "$SECRET_JSON" | jq -r '.password')
+          echo "::add-mask::$DB_PASSWORD"
+          echo "db_password=$DB_PASSWORD" >> "$GITHUB_OUTPUT"
+        # The CI IAM user behind these keys has ONLY secretsmanager:GetSecretValue
+        # on this one secret's ARN (see iam-policy-shopeasy-secret.json) — never *.
+        # DB_USER / DB_NAME / REDIS_PASSWORD stay as plain GitHub Secrets below;
+        # only the DB password is sourced from Secrets Manager, per the brief.
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Copy compose files to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          source: "docker-compose.yml,docker-compose.prod.yml"
+          target: "/opt/shopeasy"
+
+      - name: Write env files & bring the stack up
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          script: |
+            cd /opt/shopeasy
+            mkdir -p backend
+
+            # Root .env - read by docker-compose.yml (postgres/redis/image naming)
+            cat > .env <<EOF
+            DB_USER=${{ secrets.DB_USER }}
+            DB_PASSWORD=${{ steps.get_secret.outputs.db_password }}
+            DB_NAME=${{ secrets.DB_NAME }}
+            REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
+            DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
+            IMAGE_TAG=${{ needs.build-and-push.outputs.image_tag }}
+            EOF
+
+            # backend/.env - read by the backend container itself
+            cat > backend/.env <<EOF
+            PORT=5000
+            NODE_ENV=production
+            CORS_ORIGIN=${{ secrets.CORS_ORIGIN }}
+            DB_HOST=postgres
+            DB_PORT=5432
+            DB_USER=${{ secrets.DB_USER }}
+            DB_PASSWORD=${{ steps.get_secret.outputs.db_password }}
+            DB_NAME=${{ secrets.DB_NAME }}
+            REDIS_HOST=redis
+            REDIS_PORT=6379
+            REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
+            EOF
+
+            docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" -p "${{ secrets.DOCKERHUB_TOKEN }}"
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+            docker image prune -f
+        # docker-compose.prod.yml (included) publishes the frontend on host
+        # port 80 instead of the local-dev 3000, matching the assignment's
+        # required security group port for "serving the app".
+
+
